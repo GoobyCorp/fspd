@@ -381,7 +381,7 @@ def main() -> None:
 	parser.add_argument("-p", "--password", default="", type=str, help="The password to use")
 	args = parser.parse_args()
 
-	assert args.address is tuple, "Invalid address:port pair specified"
+	assert type(args.address) == tuple, "Invalid address:port pair specified"
 
 	FSP_PASSWORD = args.password
 
