@@ -22,7 +22,10 @@ KEY = None
 FSP_UPLOAD_CACHE = "tmp.bin"
 
 FSP_SERVER_DIR = "server"
+FSP_DEBUG = False
 FSP_PASSWORD = ""
+
+FSP_LAST_GET_FILE = ""
 
 def calc_pad_size(data: (bytes, bytearray), boundary: int) -> int:
 	return boundary - len(data) % boundary
@@ -270,39 +273,28 @@ class FSPRequestHandler(DatagramRequestHandler):
 	socket = None
 
 	def handle(self) -> None:
+		global FSP_LAST_GET_FILE
+
 		self.fsp_req = FSPRequest.parse(self.rfile.read(FSP_MAX_SIZE))
 
 		if self.fsp_req.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
-			if len(FSP_PASSWORD) > 0 and self.fsp_req.password != FSP_PASSWORD:
-				print("Invalid password!")
-
-				rep = FSPRequest.create(FSPCommand.CC_ERR, b"Invalid password!", 0, self.fsp_req.sequence).to_bytes()
-				self.wfile.write(rep)
+			if not self.check_password():
 				return
 
 		if self.fsp_req.command == FSPCommand.CC_GET_DIR:
 			self.handle_get_dir()
 		elif self.fsp_req.command == FSPCommand.CC_GET_FILE:
 			self.handle_get_file()
-		elif self.fsp_req.command == FSPCommand.CC_STAT:
-			rep = FSPSTAT.create(self.fsp_req.filename).to_bytes()
-			rep = FSPRequest.create(self.fsp_req.command, rep, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
-			self.wfile.write(rep)
-		elif self.fsp_req.command == FSPCommand.CC_DEL_FILE:
-			if osp.isfile(self.fsp_req.filename):
-				os.remove(self.fsp_req.filename)
-				rep = FSPRequest.create(self.fsp_req.command, b"", self.fsp_req.position, self.fsp_req.sequence).to_bytes()
-				self.wfile.write(rep)
-			else:
-				rep = FSPRequest.create(FSPCommand.CC_ERR, b"Error deleting file!", 0, self.fsp_req.sequence).to_bytes()
-				self.wfile.write(rep)
 		elif self.fsp_req.command == FSPCommand.CC_UP_LOAD:
 			self.handle_up_load()
 		elif self.fsp_req.command == FSPCommand.CC_INSTALL:
 			self.handle_install()
+		elif self.fsp_req.command == FSPCommand.CC_DEL_FILE:
+			self.handle_del_file()
 		elif self.fsp_req.command == FSPCommand.CC_BYE:
-			rep = FSPRequest.create(self.fsp_req.command, b"", 0, self.fsp_req.sequence).to_bytes()
-			self.wfile.write(rep)
+			self.handle_bye()
+		elif self.fsp_req.command == FSPCommand.CC_STAT:
+			self.handle_stat()
 		else:
 			print(self.fsp_req.command)
 			print("Key:", self.fsp_req.key)
@@ -315,25 +307,39 @@ class FSPRequestHandler(DatagramRequestHandler):
 			if len(self.fsp_req.extra) > 0:
 				print(self.fsp_req.extra)
 
+	def check_password(self) -> bool:
+		if len(FSP_PASSWORD) > 0 and self.fsp_req.password != FSP_PASSWORD:
+			if FSP_DEBUG:
+				print("Invalid password!")
+
+			rep = FSPRequest.create(FSPCommand.CC_ERR, b"Invalid password!", 0, self.fsp_req.sequence).to_bytes()
+			self.wfile.write(rep)
+			return False
+		return True
+
 	def handle_get_dir(self) -> None:
+		if FSP_DEBUG:
+			print(f"Reading directory \"{self.fsp_req.directory}\"...")
+
 		size = 0
 		files = os.listdir(self.fsp_req.directory)
 		if len(files) > 0:
-			dir_ents = b""
-			for x in files:
-				dir_ents += FSPRDIRENT.create(osp.join(self.fsp_req.directory, x)).to_bytes()
-			size = len(dir_ents)
-			rep = FSPRequest.create(self.fsp_req.command, dir_ents, 0, self.fsp_req.sequence).to_bytes()
+			rep = b"".join([FSPRDIRENT.create(osp.join(self.fsp_req.directory, x)).to_bytes() for x in files])
+			size = len(rep)
+			rep = FSPRequest.create(self.fsp_req.command, rep, 0, self.fsp_req.sequence).to_bytes()
 			self.socket.sendto(rep, self.client_address)
 
 		rep = FSPRequest.create(self.fsp_req.command, FSPRDIRENT.create_end().to_bytes(), size, self.fsp_req.sequence).to_bytes()
 		self.socket.sendto(rep, self.client_address)
 
 	def handle_get_file(self) -> None:
-		global FSP_GET_FILE_CACHE
-		global FSP_GET_FILE_CACHE_FILENAME
+		global FSP_LAST_GET_FILE
 
 		self.fsp_req.block_size = FSP_SPACE
+
+		if FSP_DEBUG and (FSP_LAST_GET_FILE == "" or FSP_LAST_GET_FILE != self.fsp_req.filename):
+			FSP_LAST_GET_FILE = self.fsp_req.filename
+			print(f"Serving file \"{self.fsp_req.filename}\"...")
 
 		with open(self.fsp_req.filename, "rb") as f:
 			f.seek(self.fsp_req.position)
@@ -357,9 +363,35 @@ class FSPRequestHandler(DatagramRequestHandler):
 	def handle_install(self) -> None:
 		global FSP_UPLOAD_CACHE
 
+		if FSP_DEBUG:
+			print(f"Installing file to \"{self.fsp_req.filename}\"...")
+
 		os.rename(FSP_UPLOAD_CACHE, self.fsp_req.filename)
 
 		rep = FSPRequest.create(self.fsp_req.command, b"", 0, self.fsp_req.sequence).to_bytes()
+		self.wfile.write(rep)
+
+	def handle_del_file(self) -> None:
+		if FSP_DEBUG:
+			print(f"Deleting file \"{self.fsp_req.filename}\"...")
+
+		if osp.isfile(self.fsp_req.filename):
+			os.remove(self.fsp_req.filename)
+			rep = FSPRequest.create(self.fsp_req.command, b"", self.fsp_req.position, self.fsp_req.sequence).to_bytes()
+		else:
+			rep = FSPRequest.create(FSPCommand.CC_ERR, b"Error deleting file!", 0, self.fsp_req.sequence).to_bytes()
+		self.wfile.write(rep)
+
+	def handle_bye(self) -> None:
+		rep = FSPRequest.create(self.fsp_req.command, b"", 0, self.fsp_req.sequence).to_bytes()
+		self.wfile.write(rep)
+
+	def handle_stat(self) -> None:
+		if FSP_DEBUG:
+			print(f"Stat'ing file \"{self.fsp_req.filename}\"...")
+
+		rep = FSPSTAT.create(self.fsp_req.filename).to_bytes()
+		rep = FSPRequest.create(self.fsp_req.command, rep, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 		self.wfile.write(rep)
 
 # https://sourceforge.net/p/fsp/code/ci/master/tree/doc/PROTOCOL
@@ -373,16 +405,18 @@ def parse_hostname_port(s: str):
 		return (hostname, int(port))
 
 def main() -> None:
-	global FSP_PASSWORD
+	global FSP_PASSWORD, FSP_DEBUG
 
 	parser = argparse.ArgumentParser(description=__description__)
 	parser.add_argument("-a", "--address", type=parse_hostname_port, default=("0.0.0.0", 7717), help="The address to bind to")
 	parser.add_argument("-p", "--password", default="", type=str, help="The password to use")
+	parser.add_argument("-d", "--debug", action="store_true", help="Write debug output")
 	args = parser.parse_args()
 
 	assert type(args.address) == tuple, "Invalid address:port pair specified"
 
 	FSP_PASSWORD = args.password
+	FSP_DEBUG = args.debug
 
 	if not osp.isdir(FSP_SERVER_DIR):
 		print("Creating server directory...")
