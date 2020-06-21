@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 __author__ = "GoobyCorp"
-__description__ = "A script used to host a FSP server primarily for Swiss on the GameCube"
+__description__ = "A script used to host an FSP server primarily for Swiss on the Nintendo GameCube"
 __credits__ = ["GoobyCorp", "Extrems"]
 
 import re
