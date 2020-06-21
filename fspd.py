@@ -80,6 +80,7 @@ class FSPRDIRENTType(IntEnum):
 
 class FSPRDIRENT:
 	FSP_RDIRENT_FMT = "!2IB"
+	FSP_RDIRENT_LEN = calcsize(FSP_RDIRENT_FMT)
 
 	time = 0
 	size = 0
@@ -130,6 +131,7 @@ class FSPRDIRENT:
 
 class FSPSTAT:
 	FSP_STAT_FMT = "!2IB"
+	FSP_STAT_LEN = calcsize(FSP_STAT_FMT)
 
 	time = 0
 	size = 0
@@ -142,27 +144,24 @@ class FSPSTAT:
 		self.time = 0
 		self.size = 0
 		self.type = 0
-		self.name = ""
 
 	@staticmethod
 	def create(path: str):
-		dir_ent = FSPRDIRENT()
+		stat = FSPSTAT()
 		if osp.isfile(path):
-			dir_ent.time = 1592534256  # osp.getmtime(path)
-			dir_ent.size = osp.getsize(path)
-			dir_ent.type = FSPRDIRENTType.RDTYPE_FILE
-			dir_ent.name = osp.basename(path)
+			stat.time = 1592534256  # osp.getmtime(path)
+			stat.size = osp.getsize(path)
+			stat.type = FSPRDIRENTType.RDTYPE_FILE
 		elif osp.isdir(path):
-			dir_ent.time = 1592534256  # osp.getmtime(path)
-			dir_ent.size = 0
-			dir_ent.type = FSPRDIRENTType.RDTYPE_DIR
-			dir_ent.name = osp.basename(path)
+			stat.time = 1592534256  # osp.getmtime(path)
+			stat.size = 0
+			stat.type = FSPRDIRENTType.RDTYPE_DIR
 		else:
-			dir_ent.time = 0
-			dir_ent.size = 0
-			dir_ent.type = 0
+			stat.time = 0
+			stat.size = 0
+			stat.type = 0
 
-		return dir_ent
+		return stat
 
 	def __bytes__(self) -> bytes:
 		return pack(self.FSP_STAT_FMT, self.time, self.size, self.type)
@@ -209,29 +208,29 @@ class FSPRequest:
 	@staticmethod
 	def parse(data: (bytes, bytearray)):
 		# parse header
-		req = FSPRequest()
-		(cmd, req.checksum, req.key, req.sequence, req.data_len, req.position) = unpack_from(FSPRequest.FSP_HDR_FMT, data, 0)
-		req.command = FSPCommand(cmd)
-		req.data = data[req.FSP_HDR_LEN:req.FSP_HDR_LEN + req.data_len]
-		req.extra = data[req.FSP_HDR_LEN + req.data_len:]
+		fsp_req = FSPRequest()
+		(cmd, fsp_req.checksum, fsp_req.key, fsp_req.sequence, fsp_req.data_len, fsp_req.position) = unpack_from(FSPRequest.FSP_HDR_FMT, data, 0)
+		fsp_req.command = FSPCommand(cmd)
+		fsp_req.data = data[fsp_req.FSP_HDR_LEN:fsp_req.FSP_HDR_LEN + fsp_req.data_len]
+		fsp_req.extra = data[fsp_req.FSP_HDR_LEN + fsp_req.data_len:]
 
 		# verify the checksum
-		calc_cksm = calc_cksm_client_to_server(req.to_bytes())
-		assert req.checksum == calc_cksm, f"Invalid FSP checksum, received: 0x{req.checksum:02X}, calculated: 0x{calc_cksm:02X}"
+		calc_cksm = calc_cksm_client_to_server(fsp_req.to_bytes())
+		assert fsp_req.checksum == calc_cksm, f"Invalid FSP checksum, received: 0x{fsp_req.checksum:02X}, calculated: 0x{calc_cksm:02X}"
 
 		# command-specific parsing
-		if req.command == FSPCommand.CC_GET_DIR:
-			(req.directory, req.password) = [x.rstrip(b"\x00").decode("UTF8") for x in req.data.split(b"\n", 1)]
-			req.directory = req.directory.lstrip("/")
-			req.directory = "./" + FSP_SERVER_DIR + "/" + req.directory
-		if req.command in [FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
-			(req.filename, req.password) = [x.rstrip(b"\x00").decode("UTF8") for x in req.data.split(b"\n", 1)]
-			req.filename = req.filename.lstrip("/")
-			req.filename = "./" + FSP_SERVER_DIR + "/" + req.filename
-			if req.command == FSPCommand.CC_GET_FILE and len(req.extra) == 2:
-				(req.block_size,) = unpack("!H", req.extra)
+		if fsp_req.command == FSPCommand.CC_GET_DIR:
+			(fsp_req.directory, fsp_req.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp_req.data.split(b"\n", 1)]
+			fsp_req.directory = fsp_req.directory.lstrip("/")
+			fsp_req.directory = "./" + FSP_SERVER_DIR + "/" + fsp_req.directory
+		if fsp_req.command in [FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
+			(fsp_req.filename, fsp_req.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp_req.data.split(b"\n", 1)]
+			fsp_req.filename = fsp_req.filename.lstrip("/")
+			fsp_req.filename = "./" + FSP_SERVER_DIR + "/" + fsp_req.filename
+			if fsp_req.command == FSPCommand.CC_GET_FILE and len(fsp_req.extra) == 2:
+				(fsp_req.block_size,) = unpack("!H", fsp_req.extra)
 
-		return req
+		return fsp_req
 
 	@staticmethod
 	def create(cmd: (int, FSPCommand), data: (bytes, bytearray) = b"", pos: int = 0, seq: int = 0):
