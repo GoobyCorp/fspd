@@ -336,37 +336,9 @@ class FSPRequestHandler(DatagramRequestHandler):
 
 		self.fsp_req.block_size = FSP_SPACE
 
-		# no idea why I decided to add this :/
-		if FSP_USE_GET_FILE_CACHE:
-			if len(FSP_GET_FILE_CACHE) > 0 and FSP_GET_FILE_CACHE_FILENAME != self.fsp_req.filename:
-				FSP_GET_FILE_CACHE = b""
-				FSP_GET_FILE_CACHE_FILENAME = ""
-
-				print(f"Caching \"{self.fsp_req.filename}\"...")
-
-				FSP_GET_FILE_CACHE_FILENAME = self.fsp_req.filename
-				# super I/O intensive but loads super fast
-				with open(FSP_GET_FILE_CACHE_FILENAME, "rb") as f:
-					FSP_GET_FILE_CACHE = f.read()
-
-				print("Done!")
-			elif len(FSP_GET_FILE_CACHE) == 0 and FSP_GET_FILE_CACHE_FILENAME == "":
-				print(f"Caching \"{self.fsp_req.filename}\"...")
-
-				FSP_GET_FILE_CACHE_FILENAME = self.fsp_req.filename
-				# super I/O intensive but loads super fast
-				with open(FSP_GET_FILE_CACHE_FILENAME, "rb") as f:
-					FSP_GET_FILE_CACHE = f.read()
-
-				print("Done!")
-
-			with BytesIO(FSP_GET_FILE_CACHE) as bio:
-				bio.seek(self.fsp_req.position)
-				buf = bio.read(self.fsp_req.block_size)
-		else:
-			with open(self.fsp_req.filename, "rb") as f:
-				f.seek(self.fsp_req.position)
-				buf = f.read(self.fsp_req.block_size)
+		with open(self.fsp_req.filename, "rb") as f:
+			f.seek(self.fsp_req.position)
+			buf = f.read(self.fsp_req.block_size)
 
 		rep = FSPRequest.create(self.fsp_req.command, buf, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 		with BytesIO(rep) as bio:
