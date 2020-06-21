@@ -11,6 +11,7 @@ import os.path as osp
 from io import BytesIO
 from enum import IntEnum
 from random import randint
+from sys import version_info
 from struct import pack, unpack, pack_into, unpack_from, calcsize
 from socketserver import ThreadingUDPServer, DatagramRequestHandler
 
@@ -406,6 +407,9 @@ def parse_hostname_port(s: str):
 
 def main() -> None:
 	global FSP_PASSWORD, FSP_DEBUG
+
+	# check python version before running
+	assert version_info.major == 3 and version_info.minor >= 8, "This script requires Python 3.8 or greater!"
 
 	parser = argparse.ArgumentParser(description=__description__)
 	parser.add_argument("-a", "--address", type=parse_hostname_port, default=("0.0.0.0", 7717), help="The address to bind to")
