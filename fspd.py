@@ -17,15 +17,16 @@ from socketserver import ThreadingUDPServer, DatagramRequestHandler
 
 FSP_HSIZE = 12
 FSP_SPACE = 1024
-FSP_MAX_SIZE = FSP_HSIZE + FSP_SPACE
+FSP_MAXSPACE = FSP_HSIZE + FSP_SPACE
 
 KEY = None
 FSP_UPLOAD_CACHE = "tmp.bin"
 
-FSP_SERVER_DIR = "server"
-FSP_DEBUG = False
+FSP_SERVER_DIR = ""
 FSP_PASSWORD = ""
 
+FSP_LAST_GET_DIR = ""
+FSP_LAST_GET_DIR_CACHE = b""
 FSP_LAST_GET_FILE = ""
 
 def calc_pad_size(data: (bytes, bytearray), boundary: int) -> int:
@@ -113,6 +114,13 @@ class FSPRDIRENT:
 			dir_ent.size = 0
 			dir_ent.type = FSPRDIRENTType.RDTYPE_DIR
 			dir_ent.name = osp.basename(path)
+
+		return dir_ent
+
+	@staticmethod
+	def create_skip():
+		dir_ent = FSPRDIRENT()
+		dir_ent.type = FSPRDIRENTType.RDTYPE_SKIP
 
 		return dir_ent
 
@@ -215,8 +223,8 @@ class FSPRequest:
 		fsp_req = FSPRequest()
 		(cmd, fsp_req.checksum, fsp_req.key, fsp_req.sequence, fsp_req.data_len, fsp_req.position) = unpack_from(FSPRequest.FSP_HDR_FMT, data, 0)
 		fsp_req.command = FSPCommand(cmd)
-		fsp_req.data = data[fsp_req.FSP_HDR_LEN:fsp_req.FSP_HDR_LEN + fsp_req.data_len]
-		fsp_req.extra = data[fsp_req.FSP_HDR_LEN + fsp_req.data_len:]
+		fsp_req.data = data[FSPRequest.FSP_HDR_LEN:FSPRequest.FSP_HDR_LEN + fsp_req.data_len]
+		fsp_req.extra = data[FSPRequest.FSP_HDR_LEN + fsp_req.data_len:]
 
 		# verify the checksum
 		calc_cksm = calc_cksm_client_to_server(fsp_req.to_bytes())
@@ -225,13 +233,13 @@ class FSPRequest:
 		# command-specific parsing
 		if fsp_req.command == FSPCommand.CC_GET_DIR:
 			(fsp_req.directory, fsp_req.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp_req.data.split(b"\n", 1)]
-			fsp_req.directory = fsp_req.directory.lstrip("/")
-			fsp_req.directory = "./" + FSP_SERVER_DIR + "/" + fsp_req.directory
+			# fsp_req.directory = fsp_req.directory.lstrip("/")
+			fsp_req.directory = osp.join(FSP_SERVER_DIR, fsp_req.directory.lstrip("/"))
 		if fsp_req.command in [FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
 			(fsp_req.filename, fsp_req.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp_req.data.split(b"\n", 1)]
-			fsp_req.filename = fsp_req.filename.lstrip("/")
-			fsp_req.filename = "./" + FSP_SERVER_DIR + "/" + fsp_req.filename
-			if fsp_req.command == FSPCommand.CC_GET_FILE and len(fsp_req.extra) == 2:
+			# fsp_req.filename = fsp_req.filename.lstrip("/")
+			fsp_req.filename = osp.join(FSP_SERVER_DIR, fsp_req.filename.lstrip("/"))
+			if fsp_req.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_FILE] and len(fsp_req.extra) == 2:
 				(fsp_req.block_size,) = unpack("!H", fsp_req.extra)
 
 		return fsp_req
@@ -276,7 +284,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 	def handle(self) -> None:
 		global FSP_LAST_GET_FILE
 
-		self.fsp_req = FSPRequest.parse(self.rfile.read(FSP_MAX_SIZE))
+		self.fsp_req = FSPRequest.parse(self.rfile.read(FSP_MAXSPACE))
 
 		if self.fsp_req.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
 			if not self.check_password():
@@ -319,26 +327,34 @@ class FSPRequestHandler(DatagramRequestHandler):
 		return True
 
 	def handle_get_dir(self) -> None:
-		if FSP_DEBUG:
-			print(f"Reading directory \"{self.fsp_req.directory}\"...")
+		global FSP_LAST_GET_DIR, FSP_LAST_GET_DIR_CACHE
 
-		size = 0
-		files = os.listdir(self.fsp_req.directory)
-		if len(files) > 0:
-			rep = b"".join([FSPRDIRENT.create(osp.join(self.fsp_req.directory, x)).to_bytes() for x in files])
-			size = len(rep)
-			rep = FSPRequest.create(self.fsp_req.command, rep, 0, self.fsp_req.sequence).to_bytes()
+		print(f"Reading directory \"{self.fsp_req.directory}\"...")
+
+		if FSP_LAST_GET_DIR == "" or len(FSP_LAST_GET_DIR_CACHE) == 0:
+			FSP_LAST_GET_DIR = self.fsp_req.directory
+
+			files = os.listdir(self.fsp_req.directory)
+			if len(files) > 0:
+				FSP_LAST_GET_DIR_CACHE += b"".join([FSPRDIRENT.create(osp.join(self.fsp_req.directory, x)).to_bytes() for x in files])
+
+			FSP_LAST_GET_DIR_CACHE += FSPRDIRENT.create_end().to_bytes()
+			rep = FSPRequest.create(self.fsp_req.command, FSP_LAST_GET_DIR_CACHE, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
+			self.socket.sendto(rep, self.client_address)
+		else:
+			rep = FSPRequest.create(self.fsp_req.command, FSP_LAST_GET_DIR_CACHE[self.fsp_req.position:], self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 			self.socket.sendto(rep, self.client_address)
 
-		rep = FSPRequest.create(self.fsp_req.command, FSPRDIRENT.create_end().to_bytes(), size, self.fsp_req.sequence).to_bytes()
-		self.socket.sendto(rep, self.client_address)
+			if self.fsp_req.position == len(FSP_LAST_GET_DIR_CACHE):
+				FSP_LAST_GET_DIR = ""
+				FSP_LAST_GET_DIR_CACHE = b""
 
 	def handle_get_file(self) -> None:
 		global FSP_LAST_GET_FILE
 
 		self.fsp_req.block_size = FSP_SPACE
 
-		if FSP_DEBUG and (FSP_LAST_GET_FILE == "" or FSP_LAST_GET_FILE != self.fsp_req.filename):
+		if (FSP_LAST_GET_FILE == "" or FSP_LAST_GET_FILE != self.fsp_req.filename):
 			FSP_LAST_GET_FILE = self.fsp_req.filename
 			print(f"Serving file \"{self.fsp_req.filename}\"...")
 
@@ -364,8 +380,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 	def handle_install(self) -> None:
 		global FSP_UPLOAD_CACHE
 
-		if FSP_DEBUG:
-			print(f"Installing file to \"{self.fsp_req.filename}\"...")
+		print(f"Installing file to \"{self.fsp_req.filename}\"...")
 
 		os.rename(FSP_UPLOAD_CACHE, self.fsp_req.filename)
 
@@ -373,8 +388,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 		self.wfile.write(rep)
 
 	def handle_del_file(self) -> None:
-		if FSP_DEBUG:
-			print(f"Deleting file \"{self.fsp_req.filename}\"...")
+		print(f"Deleting file \"{self.fsp_req.filename}\"...")
 
 		if osp.isfile(self.fsp_req.filename):
 			os.remove(self.fsp_req.filename)
@@ -388,8 +402,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 		self.wfile.write(rep)
 
 	def handle_stat(self) -> None:
-		if FSP_DEBUG:
-			print(f"Stat'ing file \"{self.fsp_req.filename}\"...")
+		print(f"Stat'ing file \"{self.fsp_req.filename}\"...")
 
 		rep = FSPSTAT.create(self.fsp_req.filename).to_bytes()
 		rep = FSPRequest.create(self.fsp_req.command, rep, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
@@ -406,27 +419,26 @@ def parse_hostname_port(s: str):
 		return (hostname, int(port))
 
 def main() -> None:
-	global FSP_PASSWORD, FSP_DEBUG
+	global FSP_PASSWORD, FSP_SERVER_DIR
 
 	# check python version before running
 	assert version_info.major == 3 and version_info.minor >= 8, "This script requires Python 3.8 or greater!"
 
 	parser = argparse.ArgumentParser(description=__description__)
 	parser.add_argument("-a", "--address", type=parse_hostname_port, default=("0.0.0.0", 7717), help="The address to bind to")
-	parser.add_argument("-p", "--password", default="", type=str, help="The password to use")
-	parser.add_argument("-d", "--debug", action="store_true", help="Write debug output")
+	parser.add_argument("-p", "--password", type=str, default="", help="The password to use")
+	parser.add_argument("-d", "--directory", type=str, default="server", help="The directory to serve from")
 	args = parser.parse_args()
 
 	assert type(args.address) == tuple, "Invalid address:port pair specified"
 
 	FSP_PASSWORD = args.password
-	FSP_DEBUG = args.debug
+	FSP_SERVER_DIR = args.directory
 
-	if not osp.isdir(FSP_SERVER_DIR):
-		print("Creating server directory...")
-		os.mkdir(FSP_SERVER_DIR)
+	assert osp.isdir(FSP_SERVER_DIR), "The specified server directory doesn't exist"
 
 	print(f"FSP server running on {args.address[0]}:{args.address[1]}...")
+	print(f"Base Directory: \"{osp.abspath(FSP_SERVER_DIR)}\"")
 	with ThreadingUDPServer((args.address[0], args.address[1]), FSPRequestHandler) as server:
 		server.serve_forever()
 
