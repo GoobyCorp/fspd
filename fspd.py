@@ -318,8 +318,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 
 	def check_password(self) -> bool:
 		if len(FSP_PASSWORD) > 0 and self.fsp_req.password != FSP_PASSWORD:
-			if FSP_DEBUG:
-				print("Invalid password!")
+			print("Invalid password!")
 
 			rep = FSPRequest.create(FSPCommand.CC_ERR, b"Invalid password!", 0, self.fsp_req.sequence).to_bytes()
 			self.wfile.write(rep)
