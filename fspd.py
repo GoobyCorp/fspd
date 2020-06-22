@@ -15,16 +15,16 @@ from sys import version_info
 from struct import pack, unpack, pack_into, unpack_from, calcsize
 from socketserver import ThreadingUDPServer, DatagramRequestHandler
 
+# constants
 FSP_HSIZE = 12
 FSP_SPACE = 1024
 FSP_MAXSPACE = FSP_HSIZE + FSP_SPACE
+FSP_UP_LOAD_CACHE_FILE = "tmp.bin"
 
-KEY = None
-FSP_UPLOAD_CACHE = "tmp.bin"
-
+# global variables
+FSP_KEY = None
 FSP_SERVER_DIR = ""
 FSP_PASSWORD = ""
-
 FSP_LAST_GET_DIR = ""
 FSP_LAST_GET_DIR_CACHE = b""
 FSP_LAST_GET_FILE = ""
@@ -246,19 +246,19 @@ class FSPRequest:
 
 	@staticmethod
 	def create(cmd: (int, FSPCommand), data: (bytes, bytearray) = b"", pos: int = 0, seq: int = 0):
-		global KEY
+		global FSP_KEY
 
 		fsp_req = FSPRequest()
 		fsp_req.command = int(cmd)
-		fsp_req.key = randint(0, 0xFFFF) if KEY is None else KEY
+		fsp_req.key = randint(0, 0xFFFF) if FSP_KEY is None else FSP_KEY
 		fsp_req.sequence = seq
 		fsp_req.data_len = len(data)
 		fsp_req.position = pos
 		fsp_req.data = data
 		fsp_req.checksum = calc_cksm_server_to_client(fsp_req.to_bytes())
 
-		if KEY is None:
-			KEY = fsp_req.key
+		if FSP_KEY is None:
+			FSP_KEY = fsp_req.key
 
 		return fsp_req
 
@@ -367,9 +367,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 				self.wfile.write(buf)
 
 	def handle_up_load(self) -> None:
-		global FSP_UPLOAD_CACHE
-
-		with open(FSP_UPLOAD_CACHE, "a+b") as f:
+		with open(FSP_UP_LOAD_CACHE_FILE, "a+b") as f:
 			f.seek(self.fsp_req.position)
 			f.write(self.fsp_req.data)
 
@@ -377,11 +375,9 @@ class FSPRequestHandler(DatagramRequestHandler):
 		self.wfile.write(rep)
 
 	def handle_install(self) -> None:
-		global FSP_UPLOAD_CACHE
-
 		print(f"Installing file to \"{self.fsp_req.filename}\"...")
 
-		os.rename(FSP_UPLOAD_CACHE, self.fsp_req.filename)
+		os.rename(FSP_UP_LOAD_CACHE_FILE, self.fsp_req.filename)
 
 		rep = FSPRequest.create(self.fsp_req.command, b"", 0, self.fsp_req.sequence).to_bytes()
 		self.wfile.write(rep)
