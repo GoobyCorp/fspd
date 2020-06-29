@@ -6,6 +6,7 @@ __credits__ = ["GoobyCorp", "Extrems"]
 
 import re
 import os
+import socket
 import argparse
 import os.path as osp
 from io import BytesIO
@@ -53,8 +54,12 @@ def calc_cksm_server_to_client(data: (bytes, bytearray)) -> int:
 	return cksm & 0xFF
 
 class FSPOffset(IntEnum):
-	OFFS_CMD  = 0
-	OFFS_CKSM = 1
+	OFFS_CMD      = 0  # 0-1
+	OFFS_CKSM     = 1  # 1-2
+	OFFS_KEY      = 2  # 2-4
+	OFFS_SEQ      = 4  # 4-6
+	OFFS_DATA_LEN = 6  # 6-8
+	OFFS_POS      = 8  # 8-12
 
 class FSPCommand(IntEnum):
 	CC_VERSION   = 0x10
@@ -77,15 +82,15 @@ class FSPCommand(IntEnum):
 	CC_LIMIT     = 0x80
 	CC_TEST      = 0x81
 
-class FSPRDIRENTType(IntEnum):
+class RDIRENTType(IntEnum):
 	RDTYPE_END  = 0x00
 	RDTYPE_FILE = 0x01
 	RDTYPE_DIR  = 0x02
 	RDTYPE_SKIP = 0x2A
 
-class FSPRDIRENT:
-	FSP_RDIRENT_FMT = "!2IB"
-	FSP_RDIRENT_LEN = calcsize(FSP_RDIRENT_FMT)
+class RDIRENT:
+	RDIRENT_FMT = "!2IB"
+	RDIRENT_LEN = calcsize(RDIRENT_FMT)
 
 	time = 0
 	size = 0
@@ -103,36 +108,36 @@ class FSPRDIRENT:
 
 	@staticmethod
 	def create(path: str):
-		dir_ent = FSPRDIRENT()
+		rdir_ent = RDIRENT()
 		if osp.isfile(path):
-			dir_ent.time = 1592534256  # osp.getmtime(path)
-			dir_ent.size = osp.getsize(path)
-			dir_ent.type = FSPRDIRENTType.RDTYPE_FILE
-			dir_ent.name = osp.basename(path)
+			rdir_ent.time = 1592534256  # osp.getmtime(path)
+			rdir_ent.size = osp.getsize(path)
+			rdir_ent.type = RDIRENTType.RDTYPE_FILE
+			rdir_ent.name = osp.basename(path)
 		elif osp.isdir(path):
-			dir_ent.time = 1592534256  # osp.getmtime(path)
-			dir_ent.size = 0
-			dir_ent.type = FSPRDIRENTType.RDTYPE_DIR
-			dir_ent.name = osp.basename(path)
+			rdir_ent.time = 1592534256  # osp.getmtime(path)
+			rdir_ent.size = 0
+			rdir_ent.type = RDIRENTType.RDTYPE_DIR
+			rdir_ent.name = osp.basename(path)
 
-		return dir_ent
+		return rdir_ent
 
 	@staticmethod
 	def create_skip():
-		dir_ent = FSPRDIRENT()
-		dir_ent.type = FSPRDIRENTType.RDTYPE_SKIP
+		rdir_ent = RDIRENT()
+		rdir_ent.type = RDIRENTType.RDTYPE_SKIP
 
-		return dir_ent
+		return rdir_ent
 
 	@staticmethod
 	def create_end():
-		dir_ent = FSPRDIRENT()
-		dir_ent.type = FSPRDIRENTType.RDTYPE_END
+		rdir_ent = RDIRENT()
+		rdir_ent.type = RDIRENTType.RDTYPE_END
 
-		return dir_ent
+		return rdir_ent
 
 	def __bytes__(self) -> bytes:
-		b = pack(self.FSP_RDIRENT_FMT, self.time, self.size, self.type)
+		b = pack(self.RDIRENT_FMT, self.time, self.size, self.type)
 		b += self.name.encode("UTF8")
 		b += b"\x00" * calc_pad_size(b, 4)
 		assert len(b) % 4 == 0, "Invalid RDIRENT size"
@@ -163,11 +168,11 @@ class FSPSTAT:
 		if osp.isfile(path):
 			stat.time = 1592534256  # osp.getmtime(path)
 			stat.size = osp.getsize(path)
-			stat.type = FSPRDIRENTType.RDTYPE_FILE
+			stat.type = RDIRENTType.RDTYPE_FILE
 		elif osp.isdir(path):
 			stat.time = 1592534256  # osp.getmtime(path)
 			stat.size = 0
-			stat.type = FSPRDIRENTType.RDTYPE_DIR
+			stat.type = RDIRENTType.RDTYPE_DIR
 		else:
 			stat.time = 0
 			stat.size = 0
@@ -284,7 +289,15 @@ class FSPRequestHandler(DatagramRequestHandler):
 	def handle(self) -> None:
 		global FSP_LAST_GET_FILE
 
-		self.fsp_req = FSPRequest.parse(self.rfile.read(FSP_MAXSPACE))
+		data = self.rfile.read(FSP_MAXSPACE)
+
+		# Handle Swiss broadcast message
+		if data == b"Swiss Broadcast Message":
+			print("Handling Swiss broadcast message...")
+			self.wfile.write(data)
+			return
+
+		self.fsp_req = FSPRequest.parse(data)
 
 		if self.fsp_req.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
 			if not self.check_password():
@@ -328,19 +341,21 @@ class FSPRequestHandler(DatagramRequestHandler):
 	def handle_get_dir(self) -> None:
 		global FSP_LAST_GET_DIR, FSP_LAST_GET_DIR_CACHE
 
-		print(f"Reading directory \"{self.fsp_req.directory}\"...")
-
 		if FSP_LAST_GET_DIR == "" or len(FSP_LAST_GET_DIR_CACHE) == 0:
+			print(f"Caching directory \"{self.fsp_req.directory}\"...")
+
 			FSP_LAST_GET_DIR = self.fsp_req.directory
 
 			files = os.listdir(self.fsp_req.directory)
 			if len(files) > 0:
-				FSP_LAST_GET_DIR_CACHE += b"".join([FSPRDIRENT.create(osp.join(self.fsp_req.directory, x)).to_bytes() for x in files])
+				FSP_LAST_GET_DIR_CACHE += b"".join([RDIRENT.create(osp.join(self.fsp_req.directory, x)).to_bytes() for x in files])
 
-			FSP_LAST_GET_DIR_CACHE += FSPRDIRENT.create_end().to_bytes()
+			FSP_LAST_GET_DIR_CACHE += RDIRENT.create_end().to_bytes()
 			rep = FSPRequest.create(self.fsp_req.command, FSP_LAST_GET_DIR_CACHE, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 			self.socket.sendto(rep, self.client_address)
 		else:
+			print(f"Reading directory \"{self.fsp_req.directory}\"...")
+
 			rep = FSPRequest.create(self.fsp_req.command, FSP_LAST_GET_DIR_CACHE[self.fsp_req.position:], self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 			self.socket.sendto(rep, self.client_address)
 
@@ -393,6 +408,8 @@ class FSPRequestHandler(DatagramRequestHandler):
 		self.wfile.write(rep)
 
 	def handle_bye(self) -> None:
+		print("Bye!")
+
 		rep = FSPRequest.create(self.fsp_req.command, b"", 0, self.fsp_req.sequence).to_bytes()
 		self.wfile.write(rep)
 
@@ -435,6 +452,8 @@ def main() -> None:
 	print(f"FSP server running on {args.address[0]}:{args.address[1]}...")
 	print(f"Base Directory: \"{osp.abspath(FSP_SERVER_DIR)}\"")
 	with ThreadingUDPServer((args.address[0], args.address[1]), FSPRequestHandler) as server:
+		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 		server.serve_forever()
 
 if __name__ == "__main__":
