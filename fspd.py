@@ -3,6 +3,11 @@
 __author__ = "GoobyCorp"
 __description__ = "A script used to host an FSP server primarily for Swiss on the Nintendo GameCube"
 __credits__ = ["GoobyCorp", "Extrems"]
+__references__ = [
+	"https://sourceforge.net/p/fsp/code/ci/master/tree/doc/PROTOCOL",
+	"https://github.com/emukidid/swiss-gc/blob/master/cube/swiss/source/devices/fsp/deviceHandler-FSP.c",
+	"https://github.com/emukidid/swiss-gc/blob/master/cube/swiss/source/devices/fsp/fsplib.c"
+]
 
 import re
 import os
@@ -421,10 +426,6 @@ class FSPRequestHandler(DatagramRequestHandler):
 
 		if len(self.fsp_req.extra) > 0:
 			print(self.fsp_req.extra)
-
-# https://sourceforge.net/p/fsp/code/ci/master/tree/doc/PROTOCOL
-# https://github.com/emukidid/swiss-gc/blob/master/cube/swiss/source/devices/fsp/deviceHandler-FSP.c
-# https://github.com/emukidid/swiss-gc/blob/master/cube/swiss/source/devices/fsp/fsplib.c
 
 def parse_hostname_port(s: str):
 	hostname_port_exp = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5}")
