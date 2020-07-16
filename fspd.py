@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 __author__ = "GoobyCorp"
-__description__ = "A script used to host an FSP server primarily for Swiss on the Nintendo GameCube"
+__description__ = "A script used to host an FSP server primarily for Swiss on the Nintendo GameCube or Wii(U)"
 __credits__ = ["GoobyCorp", "Extrems"]
 __references__ = [
 	"https://sourceforge.net/p/fsp/code/ci/master/tree/doc/PROTOCOL",

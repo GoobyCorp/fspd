@@ -1,6 +1,6 @@
 ### fspd - File Service Protocol Daemon
 
-A script used to host a FSP server primarily for Swiss on the GameCube
+A script used to host an FSP server primarily for Swiss on the Nintendo GameCube or Wii(U)
 
 Usage is as follows:
 ```
