@@ -317,16 +317,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 		elif self.fsp_req.command == FSPCommand.CC_STAT:
 			self.handle_stat()
 		else:
-			print(self.fsp_req.command)
-			print("Key:", self.fsp_req.key)
-			print("Seq:", self.fsp_req.sequence)
-			print("Pos:", self.fsp_req.position)
-
-			if len(self.fsp_req.data) > 0:
-				print(self.fsp_req.data)
-
-			if len(self.fsp_req.extra) > 0:
-				print(self.fsp_req.extra)
+			self.handle_unhandled()
 
 	def check_password(self) -> bool:
 		if len(FSP_PASSWORD) > 0 and self.fsp_req.password != FSP_PASSWORD:
@@ -418,6 +409,18 @@ class FSPRequestHandler(DatagramRequestHandler):
 		rep = FSPSTAT.create(self.fsp_req.filename).to_bytes()
 		rep = FSPRequest.create(self.fsp_req.command, rep, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 		self.wfile.write(rep)
+
+	def handle_unhandled(self) -> None:
+		print(self.fsp_req.command)
+		print("Key:", self.fsp_req.key)
+		print("Seq:", self.fsp_req.sequence)
+		print("Pos:", self.fsp_req.position)
+
+		if len(self.fsp_req.data) > 0:
+			print(self.fsp_req.data)
+
+		if len(self.fsp_req.extra) > 0:
+			print(self.fsp_req.extra)
 
 # https://sourceforge.net/p/fsp/code/ci/master/tree/doc/PROTOCOL
 # https://github.com/emukidid/swiss-gc/blob/master/cube/swiss/source/devices/fsp/deviceHandler-FSP.c
