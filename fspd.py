@@ -46,7 +46,6 @@ def calc_cksm_client_to_server(data: (bytes, bytearray)) -> int:
 def calc_cksm_server_to_client(data: (bytes, bytearray)) -> int:
 	if type(data) == bytes:
 		data = bytearray(data)
-	data = bytearray(data)
 	pack_into("!B", data, FSPOffset.OFFS_CKSM, len(data) & 0xFF)
 	cksm = -(len(data) & 0xFF)
 	cksm += sum(data)
