@@ -233,11 +233,8 @@ class GCZImage:
 					self.block_num += 1
 				bio.write(tmp)
 			data = bio.getvalue()
-		# self.block_offset = last_read_size
 		self.offset += size
 		return data
-		#else:
-		#	raise IOError("This shouldn't be possible!")
 
 	def copy(self, stream) -> None:
 		for i in range(self.num_blocks):
