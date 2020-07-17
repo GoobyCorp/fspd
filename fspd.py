@@ -204,15 +204,24 @@ class GCZImage:
 			return data
 		elif self.block_offset + size >= self.block_size:  # read overlaps block boundaries
 			left = size
-			data = b""
-			while left > 0:
-				tmp = self.read_block(self.block_num)
-				self.block_num += 1
-				left -= len(tmp)
-				data += tmp
+			with BytesIO() as bio:
+				while left != 0:
+					tmp = self.read_block(self.block_num)
+					# start at block offset for first block
+					if left == size:
+						tmp = tmp[self.block_offset:]
+					# truncate last block if needed
+					if left <= len(tmp):
+						tmp = tmp[:left]
+						self.block_offset = len(tmp)
+					left -= len(tmp)
+					# increment the block number if not the last block
+					if left > 0:
+						self.block_num += 1
+					bio.write(tmp)
+				data = bio.getvalue()
+			# self.block_offset = last_read_size
 			self.offset += size
-			data = data[:size]
-			self.block_offset = len(data)
 			return data
 		else:
 			raise IOError("This shouldn't be possible!")
@@ -514,6 +523,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 		if self.fsp_req.filename.endswith(".iso") and not osp.isfile(self.fsp_req.filename):
 			gcz_filename = self.fsp_req.filename.replace(".iso", ".gcz")
 			if osp.isfile(gcz_filename):
+				# lots of overhead with this
 				with GCZImage(gcz_filename) as gcz:
 					gcz.seek(self.fsp_req.position)
 					buf = gcz.read(self.fsp_req.block_size)
