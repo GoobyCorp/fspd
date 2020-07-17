@@ -11,6 +11,7 @@ __references__ = [
 
 import re
 import os
+import zlib
 import socket
 import argparse
 import os.path as osp
@@ -91,6 +92,138 @@ class RDIRENTType(IntEnum):
 	RDTYPE_FILE = 0x01
 	RDTYPE_DIR  = 0x02
 	RDTYPE_SKIP = 0x2A
+
+class GCZImageType(IntEnum):
+	ISO = 0
+
+class GCZImage:
+	GCZ_MAGIC = 0xB10BC001
+	GCZ_FMT = "<2I 2Q 2I"
+
+	# header
+	sub_type = None
+	compressed_data_size = None
+	data_size = None
+	block_size = None
+	num_blocks = None
+
+	offsets = ()
+	hashes = ()
+
+	# helpers
+	data_offset = None
+
+	# stream variables
+	stream = None
+	offset = 0
+	block_num = 0
+	block_offset = 0
+
+	def __init__(self, filename: str):
+		self.reset()
+		assert osp.isfile(filename), "GCZ file doesn't exist"
+		self.stream = open(filename, "rb")
+		(magic, sub_type, self.compressed_data_size, self.data_size, self.block_size, self.num_blocks) = unpack(self.GCZ_FMT, self.stream.read(32))
+		self.sub_type = GCZImageType(sub_type)
+		assert magic == self.GCZ_MAGIC, "Invalid GCZ magic"
+		assert self.block_size * self.num_blocks == self.data_size, "Invalid GCZ image size"
+		self.offsets = unpack(f"<{self.num_blocks}Q", self.stream.read(self.num_blocks * calcsize("Q")))
+		self.hashes = unpack(f"<{self.num_blocks}I", self.stream.read(self.num_blocks * calcsize("I")))
+		self.data_offset = self.stream.tell()
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+		self.close()
+
+	def reset(self) -> None:
+		self.sub_type = None
+		self.compressed_data_size = None
+		self.data_size = None
+		self.block_size = None
+		self.num_blocks = None
+		self.data_offset = None
+		self.offsets = ()
+		self.hashes = ()
+		self.stream = None
+		self.offset = 0
+		self.block_num = 0
+		self.block_offset = 0
+
+	def is_block_compressed(self, num: int) -> bool:
+		return self.offsets[num] >> 56 != 0x80
+
+	def get_decompressed_block_offset(self, num: int) -> int:
+		return num * self.block_size
+
+	def get_compressed_block_offset(self, num: int) -> int:
+		if not self.is_block_compressed(num):  # not compressed
+			return self.data_offset + (self.offsets[num] & 0xFFFFFFFFFFFFFF)
+		return self.data_offset + self.offsets[num]
+
+	def get_compressed_block_size(self, num: int) -> int:
+		blk_start = self.get_compressed_block_offset(num)
+		if num < self.num_blocks - 1:
+			return self.get_compressed_block_offset(num + 1) - blk_start
+		elif num == self.num_blocks - 1:
+			return abs(self.compressed_data_size - blk_start)
+		else:
+			raise IOError(f"Illegal block number {num}")
+
+	def read_block(self, num: int) -> bytes:
+		blk_start = self.get_compressed_block_offset(num)
+		blk_size = self.get_compressed_block_size(num)
+
+		self.stream.seek(blk_start)
+		blk_data = self.stream.read(blk_size)
+		blk_hash = zlib.adler32(blk_data) & 0xFFFFFFFF
+		assert blk_hash == self.hashes[num], f"Invalid block hash for block {num}, computed: {blk_hash:04x}, got: {self.hashes[num]:04x}"
+
+		if self.is_block_compressed(num):
+			blk_data = zlib.decompress(blk_data, zlib.MAX_WBITS, self.block_size + 64)
+
+		assert len(blk_data) == self.block_size, f"Invalid decompressed data size for block {num}, expected: {self.block_size}, got: {len(blk_data)}"
+
+		return blk_data
+
+	def tell(self) -> int:
+		return self.offset
+
+	def seek(self, offset: int) -> bool:
+		self.block_num = offset // self.block_size
+		self.block_offset = offset - (self.block_num * self.block_size)
+		self.offset = offset
+		return self.offset <= self.data_size
+
+	def read(self, size: int) -> bytes:
+		if self.block_offset + size < self.block_size:  # read doesn't overlap block boundaries
+			data = self.read_block(self.block_num)[self.block_offset:self.block_offset + size]
+			self.block_offset += size
+			self.offset += size
+			return data
+		elif self.block_offset + size >= self.block_size:  # read overlaps block boundaries
+			left = size
+			data = b""
+			while left > 0:
+				tmp = self.read_block(self.block_num)
+				self.block_num += 1
+				left -= len(tmp)
+				data += tmp
+			self.offset += size
+			data = data[:size]
+			self.block_offset = len(data)
+			return data
+		else:
+			raise IOError("This shouldn't be possible!")
+
+	def copy(self, stream) -> None:
+		for i in range(self.num_blocks):
+			stream.write(self.read_block(i))
+
+	def close(self) -> None:
+		if self.stream is not None:
+			self.stream.close()
 
 class RDIRENT:
 	RDIRENT_FMT = "!2IB"
@@ -343,7 +476,17 @@ class FSPRequestHandler(DatagramRequestHandler):
 
 			files = os.listdir(self.fsp_req.directory)
 			if len(files) > 0:
-				FSP_LAST_GET_DIR_CACHE += b"".join([RDIRENT.create(osp.join(self.fsp_req.directory, x)).to_bytes() for x in files])
+				for x in files:
+					# serve .gcz files as .iso files
+					if x.endswith(".gcz"):
+						rdir_ent = RDIRENT()
+						rdir_ent.time = 1592534256
+						rdir_ent.size = GCZImage(osp.join(self.fsp_req.directory, x)).data_size
+						rdir_ent.type = RDIRENTType.RDTYPE_FILE
+						rdir_ent.name = x.replace(".gcz", ".iso")
+					else:  # serve a regular file
+						rdir_ent = RDIRENT.create(osp.join(self.fsp_req.directory, x))
+					FSP_LAST_GET_DIR_CACHE += rdir_ent.to_bytes()
 
 			FSP_LAST_GET_DIR_CACHE += RDIRENT.create_end().to_bytes()
 			rep = FSPRequest.create(self.fsp_req.command, FSP_LAST_GET_DIR_CACHE, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
@@ -367,9 +510,17 @@ class FSPRequestHandler(DatagramRequestHandler):
 			FSP_LAST_GET_FILE = self.fsp_req.filename
 			print(f"Serving file \"{self.fsp_req.filename}\"...")
 
-		with open(self.fsp_req.filename, "rb") as f:
-			f.seek(self.fsp_req.position)
-			buf = f.read(self.fsp_req.block_size)
+		# check if the file being served is a .gcz file
+		if self.fsp_req.filename.endswith(".iso") and not osp.isfile(self.fsp_req.filename):
+			gcz_filename = self.fsp_req.filename.replace(".iso", ".gcz")
+			if osp.isfile(gcz_filename):
+				with GCZImage(gcz_filename) as gcz:
+					gcz.seek(self.fsp_req.position)
+					buf = gcz.read(self.fsp_req.block_size)
+		else:  # serve a regular file
+			with open(self.fsp_req.filename, "rb") as f:
+				f.seek(self.fsp_req.position)
+				buf = f.read(self.fsp_req.block_size)
 
 		rep = FSPRequest.create(self.fsp_req.command, buf, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 		with BytesIO(rep) as bio:
@@ -411,7 +562,17 @@ class FSPRequestHandler(DatagramRequestHandler):
 	def handle_stat(self) -> None:
 		print(f"Stat'ing file \"{self.fsp_req.filename}\"...")
 
-		rep = FSPSTAT.create(self.fsp_req.filename).to_bytes()
+		# stat a .gcz file
+		if self.fsp_req.filename.endswith(".iso") and not osp.isfile(self.fsp_req.filename):
+			gcz_filename = self.fsp_req.filename.replace(".iso", ".gcz")
+			if osp.isfile(gcz_filename):
+				stat = FSPSTAT()
+				stat.time = 1592534256
+				stat.size = GCZImage(gcz_filename).data_size
+				stat.type = RDIRENTType.RDTYPE_FILE
+				rep = stat.to_bytes()
+		else:  # stat a regular file
+			rep = FSPSTAT.create(self.fsp_req.filename).to_bytes()
 		rep = FSPRequest.create(self.fsp_req.command, rep, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 		self.wfile.write(rep)
 
