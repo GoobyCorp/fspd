@@ -22,6 +22,8 @@ from sys import version_info
 from struct import pack, unpack, pack_into, unpack_from, calcsize
 from socketserver import ThreadingUDPServer, DatagramRequestHandler
 
+from math import floor, ceil
+
 # constants
 FSP_HSIZE = 12
 FSP_SPACE = 1024
@@ -32,9 +34,11 @@ FSP_UP_LOAD_CACHE_FILE = "tmp.bin"
 FSP_KEY = None
 FSP_SERVER_DIR = ""
 FSP_PASSWORD = ""
+# caches
 FSP_LAST_GET_DIR = ""
 FSP_LAST_GET_DIR_CACHE = b""
 FSP_LAST_GET_FILE = ""
+FSP_LAST_GCZ_FILE = None
 
 def calc_pad_size(data: (bytes, bytearray), boundary: int) -> int:
 	return boundary - len(data) % boundary
@@ -94,7 +98,8 @@ class RDIRENTType(IntEnum):
 	RDTYPE_SKIP = 0x2A
 
 class GCZImageType(IntEnum):
-	ISO = 0
+	GameCube = 0
+	Wii = 1
 
 class GCZImage:
 	GCZ_MAGIC = 0xB10BC001
@@ -112,6 +117,7 @@ class GCZImage:
 
 	# helpers
 	data_offset = None
+	filename = None
 
 	# stream variables
 	stream = None
@@ -119,10 +125,11 @@ class GCZImage:
 	block_num = 0
 	block_offset = 0
 
-	def __init__(self, filename: str):
+	def __init__(self, path: str):
 		self.reset()
-		assert osp.isfile(filename), "GCZ file doesn't exist"
-		self.stream = open(filename, "rb")
+		assert osp.isfile(path), "GCZ file doesn't exist"
+		self.filename = path
+		self.stream = open(path, "rb")
 		(magic, sub_type, self.compressed_data_size, self.data_size, self.block_size, self.num_blocks) = unpack(self.GCZ_FMT, self.stream.read(32))
 		self.sub_type = GCZImageType(sub_type)
 		assert magic == self.GCZ_MAGIC, "Invalid GCZ magic"
@@ -143,9 +150,13 @@ class GCZImage:
 		self.data_size = None
 		self.block_size = None
 		self.num_blocks = None
-		self.data_offset = None
+
 		self.offsets = ()
 		self.hashes = ()
+
+		self.data_offset = None
+		self.filename = None
+
 		self.stream = None
 		self.offset = 0
 		self.block_num = 0
@@ -172,6 +183,10 @@ class GCZImage:
 			raise IOError(f"Illegal block number {num}")
 
 	def read_block(self, num: int) -> bytes:
+		# no idea why this is needed?
+		if num > self.num_blocks - 1:
+			num = self.num_blocks - 1
+
 		blk_start = self.get_compressed_block_offset(num)
 		blk_size = self.get_compressed_block_size(num)
 
@@ -187,6 +202,9 @@ class GCZImage:
 
 		return blk_data
 
+	def size(self) -> int:
+		return self.data_size
+
 	def tell(self) -> int:
 		return self.offset
 
@@ -197,34 +215,29 @@ class GCZImage:
 		return self.offset <= self.data_size
 
 	def read(self, size: int) -> bytes:
-		if self.block_offset + size < self.block_size:  # read doesn't overlap block boundaries
-			data = self.read_block(self.block_num)[self.block_offset:self.block_offset + size]
-			self.block_offset += size
-			self.offset += size
-			return data
-		elif self.block_offset + size >= self.block_size:  # read overlaps block boundaries
-			left = size
-			with BytesIO() as bio:
-				while left != 0:
-					tmp = self.read_block(self.block_num)
-					# start at block offset for first block
-					if left == size:
-						tmp = tmp[self.block_offset:]
-					# truncate last block if needed
-					if left <= len(tmp):
-						tmp = tmp[:left]
-						self.block_offset = len(tmp)
-					left -= len(tmp)
-					# increment the block number if not the last block
-					if left > 0:
-						self.block_num += 1
-					bio.write(tmp)
-				data = bio.getvalue()
-			# self.block_offset = last_read_size
-			self.offset += size
-			return data
-		else:
-			raise IOError("This shouldn't be possible!")
+		# this should handle overlapping and non-overlapping reads
+		left = size
+		with BytesIO() as bio:
+			while left != 0:
+				tmp = self.read_block(self.block_num)
+				# start at block offset for first block
+				if left == size:
+					tmp = tmp[self.block_offset:]
+				# truncate last block if needed
+				if left <= len(tmp):
+					tmp = tmp[:left]
+					self.block_offset = len(tmp)
+				left -= len(tmp)
+				# increment the block number if not the last block
+				if left > 0:
+					self.block_num += 1
+				bio.write(tmp)
+			data = bio.getvalue()
+		# self.block_offset = last_read_size
+		self.offset += size
+		return data
+		#else:
+		#	raise IOError("This shouldn't be possible!")
 
 	def copy(self, stream) -> None:
 		for i in range(self.num_blocks):
@@ -511,7 +524,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 				FSP_LAST_GET_DIR_CACHE = b""
 
 	def handle_get_file(self) -> None:
-		global FSP_LAST_GET_FILE
+		global FSP_LAST_GET_FILE, FSP_LAST_GCZ_FILE
 
 		self.fsp_req.block_size = FSP_SPACE
 
@@ -523,11 +536,29 @@ class FSPRequestHandler(DatagramRequestHandler):
 		if self.fsp_req.filename.endswith(".iso") and not osp.isfile(self.fsp_req.filename):
 			gcz_filename = self.fsp_req.filename.replace(".iso", ".gcz")
 			if osp.isfile(gcz_filename):
-				# lots of overhead with this
-				with GCZImage(gcz_filename) as gcz:
+				if FSP_LAST_GCZ_FILE is None:
+					gcz = GCZImage(gcz_filename)
 					gcz.seek(self.fsp_req.position)
 					buf = gcz.read(self.fsp_req.block_size)
+					FSP_LAST_GCZ_FILE = gcz
+				elif FSP_LAST_GCZ_FILE is not None and FSP_LAST_GCZ_FILE.filename != FSP_LAST_GET_FILE.replace(".iso", ".gcz"):
+					FSP_LAST_GCZ_FILE.close()
+					FSP_LAST_GCZ_FILE = None
+
+					gcz = GCZImage(gcz_filename)
+					gcz.seek(self.fsp_req.position)
+					buf = gcz.read(self.fsp_req.block_size)
+					FSP_LAST_GCZ_FILE = gcz
+				else:
+					# print(f"Reading GCZ from cache \"{gcz_filename}\"")
+					FSP_LAST_GCZ_FILE.seek(self.fsp_req.position)
+					buf = FSP_LAST_GCZ_FILE.read(self.fsp_req.block_size)
 		else:  # serve a regular file
+			if FSP_LAST_GCZ_FILE is not None:
+				print("Clearing GCZ cache...")
+				FSP_LAST_GCZ_FILE.close()
+				FSP_LAST_GCZ_FILE = None
+
 			with open(self.fsp_req.filename, "rb") as f:
 				f.seek(self.fsp_req.position)
 				buf = f.read(self.fsp_req.block_size)
@@ -564,7 +595,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 		self.wfile.write(rep)
 
 	def handle_bye(self) -> None:
-		print("Bye!")
+		# print("Bye!")
 
 		rep = FSPRequest.create(self.fsp_req.command, b"", 0, self.fsp_req.sequence).to_bytes()
 		self.wfile.write(rep)
