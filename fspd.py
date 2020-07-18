@@ -495,11 +495,11 @@ class FSPRequestHandler(DatagramRequestHandler):
 				if single.endswith(".gcz"):
 					rdir_ent = RDIRENT()
 					rdir_ent.time = 1592534256
-					rdir_ent.size = GCZImage(osp.join(self.fsp_req.directory, x)).data_size
+					rdir_ent.size = GCZImage(osp.join(self.fsp_req.directory, single)).data_size
 					rdir_ent.type = RDIRENTType.RDTYPE_FILE
 					rdir_ent.name = single.replace(".gcz", ".iso")
 				else:  # serve a regular file
-					rdir_ent = RDIRENT.create(osp.join(self.fsp_req.directory, x))
+					rdir_ent = RDIRENT.create(osp.join(self.fsp_req.directory, single))
 				# add rdirent to processing queue
 				rdir_ents.append(rdir_ent.to_bytes())
 
