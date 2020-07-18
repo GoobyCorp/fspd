@@ -22,8 +22,6 @@ from sys import version_info
 from struct import pack, unpack, pack_into, unpack_from, calcsize
 from socketserver import ThreadingUDPServer, DatagramRequestHandler
 
-from math import floor, ceil
-
 # constants
 FSP_HSIZE = 12
 FSP_SPACE = 1024
@@ -35,8 +33,6 @@ FSP_KEY = None
 FSP_SERVER_DIR = ""
 FSP_PASSWORD = ""
 # caches
-FSP_LAST_GET_DIR = ""
-FSP_LAST_GET_DIR_CACHE = b""
 FSP_LAST_GET_FILE = ""
 FSP_LAST_GCZ_FILE = None
 
