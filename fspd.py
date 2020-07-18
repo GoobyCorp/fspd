@@ -485,28 +485,32 @@ class FSPRequestHandler(DatagramRequestHandler):
 		return True
 
 	def handle_get_dir(self) -> None:
-		print(self.fsp_req.position)
+		print(f"Listing directory {self.fsp_req.directory}...")
 
 		rdir_ents = []
 		files = os.listdir(self.fsp_req.directory)
 		if len(files) > 0:
-			for x in files:
+			for single in files:
 				# serve .gcz files as .iso files
-				if x.endswith(".gcz"):
+				if single.endswith(".gcz"):
 					rdir_ent = RDIRENT()
 					rdir_ent.time = 1592534256
 					rdir_ent.size = GCZImage(osp.join(self.fsp_req.directory, x)).data_size
 					rdir_ent.type = RDIRENTType.RDTYPE_FILE
-					rdir_ent.name = x.replace(".gcz", ".iso")
+					rdir_ent.name = single.replace(".gcz", ".iso")
 				else:  # serve a regular file
 					rdir_ent = RDIRENT.create(osp.join(self.fsp_req.directory, x))
+				# add rdirent to processing queue
 				rdir_ents.append(rdir_ent.to_bytes())
 
+		# create the end whether there's files or not
 		rdir_ents.append(RDIRENT.create_end().to_bytes())
 
 		rdir_pkts = []
+		# loop until we're done creating packets
 		while True:
 			rdir_pkt = b""
+			# loop until we're done processing the rdirent queue
 			while len(rdir_ents) > 0:
 				# grab the first entry
 				rdir_ent = rdir_ents.pop(0)
@@ -524,6 +528,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 					break
 				elif len(rdir_pkt) + len(rdir_ent) <= FSP_SPACE:
 					rdir_pkt += rdir_ent
+			# add the packet to the send queue
 			rdir_pkts.append(rdir_pkt)
 			# no more entries left so let's leave the loop and send them
 			if len(rdir_ents) == 0:
