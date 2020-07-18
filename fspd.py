@@ -533,13 +533,9 @@ class FSPRequestHandler(DatagramRequestHandler):
 			if len(rdir_ents) == 0:
 				break
 
-		i = 0
 		for pkt in rdir_pkts:
-			print(f"Packet #{i}")
-			print(pkt.hex())
 			rep = FSPRequest.create(self.fsp_req.command, pkt[self.fsp_req.position:], self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 			self.socket.sendto(rep, self.client_address)
-			i += 1
 
 	def handle_get_file(self) -> None:
 		global FSP_LAST_GET_FILE, FSP_LAST_GCZ_FILE
