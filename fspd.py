@@ -103,6 +103,11 @@ class GCZImage:
 	GCZ_MAGIC = 0xB10BC001
 	GCZ_FMT = "<2I 2Q 2I"
 
+	# seek
+	SEEK_SET = 0
+	SEEK_CUR = 1
+	SEEK_END = 2
+
 	# header
 	sub_type = None
 	compressed_data_size = None
@@ -206,10 +211,16 @@ class GCZImage:
 	def tell(self) -> int:
 		return self.offset
 
-	def seek(self, offset: int) -> bool:
-		self.block_num = offset // self.block_size
-		self.block_offset = offset - (self.block_num * self.block_size)
-		self.offset = offset
+	def seek(self, offset: int, whence: int = SEEK_SET) -> bool:
+		if whence == self.SEEK_SET:
+			self.offset = offset
+		elif whence == self.SEEK_CUR:
+			self.offset += offset
+		elif whence == self.SEEK_END:
+			self.offset = self.size() + offset
+
+		self.block_num = self.offset // self.block_size
+		self.block_offset = self.offset % self.block_size
 		return self.offset <= self.data_size
 
 	def read(self, size: int) -> bytes:
