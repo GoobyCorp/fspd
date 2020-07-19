@@ -35,6 +35,8 @@ FSP_PASSWORD = ""
 # caches
 FSP_LAST_GET_FILE = ""
 FSP_LAST_GCZ_FILE = None
+FSP_LAST_GET_DIR = ""
+FSP_LAST_GET_DIR_PKTS = []
 
 def calc_pad_size(data: (bytes, bytearray), boundary: int) -> int:
 	return boundary - len(data) % boundary
@@ -485,57 +487,68 @@ class FSPRequestHandler(DatagramRequestHandler):
 		return True
 
 	def handle_get_dir(self) -> None:
-		print(f"Listing directory {self.fsp_req.directory}...")
+		global FSP_LAST_GET_DIR, FSP_LAST_GET_DIR_PKTS
 
-		rdir_ents = []
-		files = os.listdir(self.fsp_req.directory)
-		if len(files) > 0:
-			for single in files:
-				# serve .gcz files as .iso files
-				if single.endswith(".gcz"):
-					rdir_ent = RDIRENT()
-					rdir_ent.time = 1592534256
-					rdir_ent.size = GCZImage(osp.join(self.fsp_req.directory, single)).data_size
-					rdir_ent.type = RDIRENTType.RDTYPE_FILE
-					rdir_ent.name = single.replace(".gcz", ".iso")
-				else:  # serve a regular file
-					rdir_ent = RDIRENT.create(osp.join(self.fsp_req.directory, single))
-				# add rdirent to processing queue
-				rdir_ents.append(rdir_ent.to_bytes())
+		pkt_num = self.fsp_req.position // FSP_SPACE
+		pkt_off = self.fsp_req.position % FSP_SPACE
 
-		# create the end whether there's files or not
-		rdir_ents.append(RDIRENT.create_end().to_bytes())
+		if FSP_LAST_GET_DIR == "" or len(FSP_LAST_GET_DIR_PKTS) == 0 or self.fsp_req.directory != FSP_LAST_GET_DIR:
+			print(f"Caching directory {self.fsp_req.directory}...")
 
-		rdir_pkts = []
-		# loop until we're done creating packets
-		while True:
-			rdir_pkt = b""
-			# loop until we're done processing the rdirent queue
-			while len(rdir_ents) > 0:
-				# grab the first entry
-				rdir_ent = rdir_ents.pop(0)
-				# entry will overlap directory block boundary
-				if len(rdir_pkt) + len(rdir_ent) > FSP_SPACE:
-					# pad to boundary
-					if len(rdir_pkt) + RDIRENT.RDIRENT_LEN > FSP_SPACE:
-						rdir_pkt += b"\x00" * calc_pad_size(rdir_pkt, FSP_SPACE)
-					else:  # send skip and pad to boundary
-						rdir_pkt += RDIRENT.create_skip().to_bytes()
-						rdir_pkt += b"\x00" * calc_pad_size(rdir_pkt, FSP_SPACE)
-					# we couldn't add it to the current packet so add it back to the queue
-					rdir_ents.insert(0, rdir_ent)
-					# packet is full so leave the loop and append it to the send queue
+			FSP_LAST_GET_DIR = self.fsp_req.directory
+			FSP_LAST_GET_DIR_PKTS = []
+
+			rdir_ents = []
+			files = os.listdir(self.fsp_req.directory)
+			if len(files) > 0:
+				for single in files:
+					# serve .gcz files as .iso files
+					if single.endswith(".gcz"):
+						rdir_ent = RDIRENT()
+						rdir_ent.time = 1592534256
+						rdir_ent.size = GCZImage(osp.join(self.fsp_req.directory, single)).data_size
+						rdir_ent.type = RDIRENTType.RDTYPE_FILE
+						rdir_ent.name = single.replace(".gcz", ".iso")
+					else:  # serve a regular file
+						rdir_ent = RDIRENT.create(osp.join(self.fsp_req.directory, single))
+					# add rdirent to processing queue
+					rdir_ents.append(rdir_ent.to_bytes())
+
+			# create the end whether there's files or not
+			rdir_ents.append(RDIRENT.create_end().to_bytes())
+
+			# rdir_pkts = []
+			# loop until we're done creating packets
+			while True:
+				rdir_pkt = b""
+				# loop until we're done processing the rdirent queue
+				while len(rdir_ents) > 0:
+					# grab the first entry
+					rdir_ent = rdir_ents.pop(0)
+					# entry will overlap directory block boundary
+					if len(rdir_pkt) + len(rdir_ent) > FSP_SPACE:
+						# pad to boundary
+						if len(rdir_pkt) + RDIRENT.RDIRENT_LEN > FSP_SPACE:
+							rdir_pkt += b"\x00" * calc_pad_size(rdir_pkt, FSP_SPACE)
+						else:  # send skip and pad to boundary
+							rdir_pkt += RDIRENT.create_skip().to_bytes()
+							rdir_pkt += b"\x00" * calc_pad_size(rdir_pkt, FSP_SPACE)
+						# we couldn't add it to the current packet so add it back to the queue
+						rdir_ents.insert(0, rdir_ent)
+						# packet is full so leave the loop and append it to the send queue
+						break
+					elif len(rdir_pkt) + len(rdir_ent) <= FSP_SPACE:
+						rdir_pkt += rdir_ent
+				# add the packet to the send queue
+				FSP_LAST_GET_DIR_PKTS.append(rdir_pkt)
+				# no more entries left so let's leave the loop and send them
+				if len(rdir_ents) == 0:
 					break
-				elif len(rdir_pkt) + len(rdir_ent) <= FSP_SPACE:
-					rdir_pkt += rdir_ent
-			# add the packet to the send queue
-			rdir_pkts.append(rdir_pkt)
-			# no more entries left so let's leave the loop and send them
-			if len(rdir_ents) == 0:
-				break
 
-		for pkt in rdir_pkts:
-			rep = FSPRequest.create(self.fsp_req.command, pkt[self.fsp_req.position:], self.fsp_req.position, self.fsp_req.sequence).to_bytes()
+		if self.fsp_req.directory == FSP_LAST_GET_DIR and len(FSP_LAST_GET_DIR_PKTS) > 0:
+			if pkt_num == 0:
+				print(f"Reading directory \"{self.fsp_req.directory}\"...")
+			rep = FSPRequest.create(self.fsp_req.command, FSP_LAST_GET_DIR_PKTS[pkt_num][pkt_off:], self.fsp_req.position, self.fsp_req.sequence).to_bytes()
 			self.socket.sendto(rep, self.client_address)
 
 	def handle_get_file(self) -> None:
