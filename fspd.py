@@ -492,9 +492,8 @@ class FSPRequestHandler(DatagramRequestHandler):
 		pkt_num = self.fsp_req.position // FSP_SPACE
 		pkt_off = self.fsp_req.position % FSP_SPACE
 
+		# cache the directory contents
 		if FSP_LAST_GET_DIR == "" or len(FSP_LAST_GET_DIR_PKTS) == 0 or self.fsp_req.directory != FSP_LAST_GET_DIR:
-			print(f"Caching directory {self.fsp_req.directory}...")
-
 			FSP_LAST_GET_DIR = self.fsp_req.directory
 			FSP_LAST_GET_DIR_PKTS = []
 
@@ -517,7 +516,6 @@ class FSPRequestHandler(DatagramRequestHandler):
 			# create the end whether there's files or not
 			rdir_ents.append(RDIRENT.create_end().to_bytes())
 
-			# rdir_pkts = []
 			# loop until we're done creating packets
 			while True:
 				rdir_pkt = b""
@@ -545,6 +543,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 				if len(rdir_ents) == 0:
 					break
 
+		# send the cached packets
 		if self.fsp_req.directory == FSP_LAST_GET_DIR and len(FSP_LAST_GET_DIR_PKTS) > 0:
 			if pkt_num == 0:
 				print(f"Reading directory \"{self.fsp_req.directory}\"...")
@@ -687,6 +686,8 @@ def main() -> None:
 	with ThreadingUDPServer((args.address[0], args.address[1]), FSPRequestHandler) as server:
 		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, FSP_MAXSPACE)
+		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, FSP_MAXSPACE)
 		server.serve_forever()
 
 if __name__ == "__main__":
