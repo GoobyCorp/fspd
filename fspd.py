@@ -39,6 +39,8 @@ FSP_LAST_GET_DIR = ""
 FSP_LAST_GET_DIR_PKTS = []
 
 def calc_pad_size(data: (bytes, bytearray), boundary: int) -> int:
+	if len(data) == boundary:
+		return 0
 	return boundary - len(data) % boundary
 
 def calc_cksm_client_to_server(data: (bytes, bytearray)) -> int:
@@ -546,7 +548,7 @@ class FSPRequestHandler(DatagramRequestHandler):
 						rdir_ents.insert(0, rdir_ent)
 						# packet is full so leave the loop and append it to the send queue
 						break
-					elif len(rdir_pkt) + len(rdir_ent) <= FSP_SPACE:
+					elif len(rdir_pkt) + len(rdir_ent) <= FSP_SPACE:  # block fits within the directory block boundary
 						rdir_pkt += rdir_ent
 				# add the packet to the send queue
 				FSP_LAST_GET_DIR_PKTS.append(rdir_pkt)
