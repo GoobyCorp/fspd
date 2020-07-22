@@ -39,9 +39,7 @@ FSP_LAST_GET_DIR = ""
 FSP_LAST_GET_DIR_PKTS = []
 
 def calc_pad_size(data: (bytes, bytearray), boundary: int) -> int:
-	if len(data) == boundary:
-		return 0
-	return boundary - len(data) % boundary
+	return 0 if len(data) == boundary else (boundary - len(data) % boundary)
 
 def calc_cksm_client_to_server(data: (bytes, bytearray)) -> int:
 	if type(data) == bytes:
