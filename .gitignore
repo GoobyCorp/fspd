@@ -1,0 +1,6 @@
+/.idea/
+/server/
+
+generate_junk.py
+remove_junk.py
+tcp_gecko.py
