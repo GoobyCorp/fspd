@@ -16,6 +16,7 @@ import socket
 import argparse
 import os.path as osp
 from io import BytesIO
+from typing import Union
 from enum import IntEnum
 from random import randint
 from sys import version_info
@@ -25,6 +26,7 @@ from socketserver import ThreadingUDPServer, DatagramRequestHandler
 # constants
 FSP_HSIZE = 12
 FSP_SPACE = 1024
+FSP_PRO_BYTES = 1
 FSP_MAXSPACE = FSP_HSIZE + FSP_SPACE
 FSP_UP_LOAD_CACHE_FILE = "tmp.bin"
 
@@ -38,11 +40,11 @@ FSP_LAST_GCZ_FILE = None
 FSP_LAST_GET_DIR = ""
 FSP_LAST_GET_DIR_PKTS = []
 
-def calc_pad_size(data: (bytes, bytearray), boundary: int) -> int:
+def calc_pad_size(data: Union[bytes, bytearray], boundary: int) -> int:
 	return 0 if len(data) == boundary else (boundary - len(data) % boundary)
 
-def calc_cksm_client_to_server(data: (bytes, bytearray)) -> int:
-	if type(data) == bytes:
+def calc_cksm_client_to_server(data: Union[bytes, bytearray]) -> int:
+	if isinstance(data, bytes):
 		data = bytearray(data)
 	pack_into("!B", data, FSPOffset.OFFS_CKSM, 0)
 	cksm = 0
@@ -51,14 +53,17 @@ def calc_cksm_client_to_server(data: (bytes, bytearray)) -> int:
 	cksm += cksm >> 8
 	return cksm & 0xFF
 
-def calc_cksm_server_to_client(data: (bytes, bytearray)) -> int:
-	if type(data) == bytes:
+def calc_cksm_server_to_client(data: Union[bytes, bytearray]) -> int:
+	if isinstance(data, bytes):
 		data = bytearray(data)
 	pack_into("!B", data, FSPOffset.OFFS_CKSM, len(data) & 0xFF)
 	cksm = -(len(data) & 0xFF)
 	cksm += sum(data)
 	cksm += cksm >> 8
 	return cksm & 0xFF
+
+def pjoin(*args, **kwargs):
+	return osp.join(*args, **kwargs).replace(osp.sep, "/")
 
 class FSPOffset(IntEnum):
 	OFFS_CMD      = 0  # 0-1
@@ -67,6 +72,16 @@ class FSPOffset(IntEnum):
 	OFFS_SEQ      = 4  # 4-6
 	OFFS_DATA_LEN = 6  # 6-8
 	OFFS_POS      = 8  # 8-12
+
+class FSPProtection(IntEnum):
+	OWNER  = 0x01
+	DEL    = 0x02
+	ADD    = 0x04
+	MKDIR  = 0x08
+	GET    = 0x10
+	README = 0x20
+	LIST   = 0x40
+	RENAME = 0x80
 
 class FSPCommand(IntEnum):
 	CC_VERSION   = 0x10
@@ -131,8 +146,7 @@ class GCZImage:
 	def __init__(self, path: str):
 		self.reset()
 		assert osp.isfile(path), "GCZ file doesn't exist"
-		self.filename = path
-		self.stream = open(path, "rb")
+		self.open(path)
 		(magic, sub_type, self.compressed_data_size, self.data_size, self.block_size, self.num_blocks) = unpack(self.GCZ_FMT, self.stream.read(32))
 		self.sub_type = GCZImageType(sub_type)
 		assert magic == self.GCZ_MAGIC, "Invalid GCZ magic"
@@ -223,7 +237,10 @@ class GCZImage:
 		self.block_offset = self.offset % self.block_size
 		return self.offset <= self.data_size
 
-	def read(self, size: int) -> bytes:
+	def read(self, size: int, single: bool = False) -> bytes:
+		if single and self.stream is None:
+			self.open()
+
 		# this should handle overlapping and non-overlapping reads
 		left = size
 		with BytesIO() as bio:
@@ -241,17 +258,37 @@ class GCZImage:
 				if left > 0:
 					self.block_num += 1
 				bio.write(tmp)
+			# grab the data
 			data = bio.getvalue()
+		# increment the offset
 		self.offset += size
+
+		if single:
+			self.close()
+
+		# return the data
 		return data
 
 	def copy(self, stream) -> None:
 		for i in range(self.num_blocks):
 			stream.write(self.read_block(i))
 
+	def open(self, filename: str = None):
+		# supports reopening the same file since we don't know
+		# when the gamecube is done reading a GCZ block
+		if filename is not None:
+			self.filename = filename
+			self.stream = open(filename, "rb")
+		elif filename is None and self.stream is None:
+			self.stream = open(self.filename, "rb")
+			self.stream.seek(self.data_offset)
+
+		return self
+
 	def close(self) -> None:
 		if self.stream is not None:
 			self.stream.close()
+			self.stream = None
 
 class RDIRENT:
 	RDIRENT_FMT = "!2IB"
@@ -354,7 +391,7 @@ class FSPSTAT:
 	def to_bytes(self) -> bytes:
 		return bytes(self)
 
-class FSPRequest:
+class FSPPacket:
 	FSP_HDR_FMT = "!2B3HI"
 	FSP_HDR_LEN = calcsize(FSP_HDR_FMT)
 
@@ -369,6 +406,9 @@ class FSPRequest:
 
 	# command-specific variables
 	directory = ""
+	path = ""
+	src_path = ""
+	dst_path = ""
 	password = ""
 	filename = ""
 	block_size = FSP_SPACE
@@ -387,53 +427,60 @@ class FSPRequest:
 		self.extra = b""
 
 		self.directory = ""
+		self.path = ""
+		self.src_path = ""
+		self.dst_path = ""
 		self.password = ""
 		self.filename = ""
 
 	@staticmethod
-	def parse(data: (bytes, bytearray)):
+	def parse(data: Union[bytes, bytearray]):
 		# parse header
-		fsp_req = FSPRequest()
-		(cmd, fsp_req.checksum, fsp_req.key, fsp_req.sequence, fsp_req.data_len, fsp_req.position) = unpack_from(FSPRequest.FSP_HDR_FMT, data, 0)
-		fsp_req.command = FSPCommand(cmd)
-		fsp_req.data = data[FSPRequest.FSP_HDR_LEN:FSPRequest.FSP_HDR_LEN + fsp_req.data_len]
-		fsp_req.extra = data[FSPRequest.FSP_HDR_LEN + fsp_req.data_len:]
+		fsp = FSPPacket()
+		(cmd, fsp.checksum, fsp.key, fsp.sequence, fsp.data_len, fsp.position) = unpack_from(FSPPacket.FSP_HDR_FMT, data, 0)
+		fsp.command = FSPCommand(cmd)
+		fsp.data = data[FSPPacket.FSP_HDR_LEN:FSPPacket.FSP_HDR_LEN + fsp.data_len]
+		fsp.extra = data[FSPPacket.FSP_HDR_LEN + fsp.data_len:]
 
 		# verify the checksum
-		calc_cksm = calc_cksm_client_to_server(fsp_req.to_bytes())
-		assert fsp_req.checksum == calc_cksm, f"Invalid FSP checksum, received: 0x{fsp_req.checksum:02X}, calculated: 0x{calc_cksm:02X}"
+		calc_cksm = calc_cksm_client_to_server(fsp.to_bytes())
+		assert fsp.checksum == calc_cksm, f"Invalid FSP checksum, received: 0x{fsp.checksum:02X}, calculated: 0x{calc_cksm:02X}"
 
 		# command-specific parsing
-		if fsp_req.command == FSPCommand.CC_GET_DIR:
-			(fsp_req.directory, fsp_req.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp_req.data.split(b"\n", 1)]
-			# fsp_req.directory = fsp_req.directory.lstrip("/")
-			fsp_req.directory = osp.join(FSP_SERVER_DIR, fsp_req.directory.lstrip("/"))
-		if fsp_req.command in [FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
-			(fsp_req.filename, fsp_req.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp_req.data.split(b"\n", 1)]
-			# fsp_req.filename = fsp_req.filename.lstrip("/")
-			fsp_req.filename = osp.join(FSP_SERVER_DIR, fsp_req.filename.lstrip("/"))
-			if fsp_req.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_FILE] and len(fsp_req.extra) == 2:
-				(fsp_req.block_size,) = unpack("!H", fsp_req.extra)
+		if fsp.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_PRO, FSPCommand.CC_MAKE_DIR]:
+			(fsp.directory, fsp.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp.data.split(b"\n", 1)]
+			fsp.path = pjoin(FSP_SERVER_DIR, fsp.directory.lstrip("/"))
+		elif fsp.command == FSPCommand.CC_RENAME:
+			(fsp.src, fsp.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp.data.split(b"\n", 1)]
+			fsp.src_path = pjoin(FSP_SERVER_DIR, fsp.src.lstrip("/"))
+			(fsp.dst, fsp.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp.extra.split(b"\n", 1)]
+			fsp.dst_path = pjoin(FSP_SERVER_DIR, fsp.dst.lstrip("/"))
+		elif fsp.command in [FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
+			(fsp.filename, fsp.password) = [x.rstrip(b"\x00").decode("UTF8") for x in fsp.data.split(b"\n", 1)]
+			fsp.path = pjoin(FSP_SERVER_DIR, fsp.filename.lstrip("/"))
+			if fsp.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_FILE] and len(fsp.extra) == 2:
+				(fsp.block_size,) = unpack("!H", fsp.extra)
 
-		return fsp_req
+		return fsp
 
 	@staticmethod
-	def create(cmd: (int, FSPCommand), data: (bytes, bytearray) = b"", pos: int = 0, seq: int = 0):
+	def create(cmd: (int, FSPCommand), data: Union[bytes, bytearray] = b"", pos: int = 0, seq: int = 0, extra: Union[bytes, bytearray] = b""):
 		global FSP_KEY
 
-		fsp_req = FSPRequest()
-		fsp_req.command = int(cmd)
-		fsp_req.key = randint(0, 0xFFFF) if FSP_KEY is None else FSP_KEY
-		fsp_req.sequence = seq
-		fsp_req.data_len = len(data)
-		fsp_req.position = pos
-		fsp_req.data = data
-		fsp_req.checksum = calc_cksm_server_to_client(fsp_req.to_bytes())
+		fsp = FSPPacket()
+		fsp.command = int(cmd)
+		fsp.key = randint(0, 0xFFFF) if FSP_KEY is None else FSP_KEY
+		fsp.sequence = seq
+		fsp.data_len = len(data)
+		fsp.position = pos
+		fsp.data = data
+		fsp.extra = extra
+		fsp.checksum = calc_cksm_server_to_client(fsp.to_bytes())
 
 		if FSP_KEY is None:
-			FSP_KEY = fsp_req.key
+			FSP_KEY = fsp.key
 
-		return fsp_req
+		return fsp
 
 	def __len__(self) -> int:
 		return calcsize(self.FSP_HDR_FMT) + len(self.data) + len(self.extra)
@@ -450,8 +497,8 @@ class FSPRequest:
 	def to_bytes(self) -> bytes:
 		return bytes(self)
 
-class FSPRequestHandler(DatagramRequestHandler):
-	fsp_req = None
+class FSPPacketHandler(DatagramRequestHandler):
+	fsp = None
 	socket = None
 
 	def handle(self) -> None:
@@ -465,34 +512,40 @@ class FSPRequestHandler(DatagramRequestHandler):
 			self.wfile.write(data)
 			return
 
-		self.fsp_req = FSPRequest.parse(data)
+		self.fsp = FSPPacket.parse(data)
 
-		if self.fsp_req.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
+		if self.fsp.command in [FSPCommand.CC_GET_DIR, FSPCommand.CC_GET_FILE, FSPCommand.CC_STAT, FSPCommand.CC_DEL_FILE, FSPCommand.CC_INSTALL]:
 			if not self.check_password():
 				return
 
-		if self.fsp_req.command == FSPCommand.CC_GET_DIR:
+		if self.fsp.command == FSPCommand.CC_GET_DIR:
 			self.handle_get_dir()
-		elif self.fsp_req.command == FSPCommand.CC_GET_FILE:
+		elif self.fsp.command == FSPCommand.CC_GET_FILE:
 			self.handle_get_file()
-		elif self.fsp_req.command == FSPCommand.CC_UP_LOAD:
+		elif self.fsp.command == FSPCommand.CC_UP_LOAD:
 			self.handle_up_load()
-		elif self.fsp_req.command == FSPCommand.CC_INSTALL:
+		elif self.fsp.command == FSPCommand.CC_INSTALL:
 			self.handle_install()
-		elif self.fsp_req.command == FSPCommand.CC_DEL_FILE:
+		elif self.fsp.command == FSPCommand.CC_DEL_FILE:
 			self.handle_del_file()
-		elif self.fsp_req.command == FSPCommand.CC_BYE:
+		elif self.fsp.command == FSPCommand.CC_GET_PRO:
+			self.handle_get_pro()
+		elif self.fsp.command == FSPCommand.CC_MAKE_DIR:
+			self.handle_make_dir()
+		elif self.fsp.command == FSPCommand.CC_BYE:
 			self.handle_bye()
-		elif self.fsp_req.command == FSPCommand.CC_STAT:
+		elif self.fsp.command == FSPCommand.CC_STAT:
 			self.handle_stat()
+		elif self.fsp.command == FSPCommand.CC_RENAME:
+			self.handle_rename()
 		else:
 			self.handle_unhandled()
 
 	def check_password(self) -> bool:
-		if len(FSP_PASSWORD) > 0 and self.fsp_req.password != FSP_PASSWORD:
+		if len(FSP_PASSWORD) > 0 and self.fsp.password != FSP_PASSWORD:
 			print("Invalid password!")
 
-			rep = FSPRequest.create(FSPCommand.CC_ERR, b"Invalid password!", 0, self.fsp_req.sequence).to_bytes()
+			rep = FSPPacket.create(FSPCommand.CC_ERR, b"Invalid password!", 0, self.fsp.sequence).to_bytes()
 			self.wfile.write(rep)
 			return False
 		return True
@@ -500,27 +553,27 @@ class FSPRequestHandler(DatagramRequestHandler):
 	def handle_get_dir(self) -> None:
 		global FSP_LAST_GET_DIR, FSP_LAST_GET_DIR_PKTS
 
-		pkt_num = self.fsp_req.position // FSP_SPACE
-		pkt_off = self.fsp_req.position % FSP_SPACE
+		pkt_num = self.fsp.position // FSP_SPACE
+		pkt_off = self.fsp.position % FSP_SPACE
 
 		# cache the directory contents
-		if FSP_LAST_GET_DIR == "" or len(FSP_LAST_GET_DIR_PKTS) == 0 or self.fsp_req.directory != FSP_LAST_GET_DIR:
-			FSP_LAST_GET_DIR = self.fsp_req.directory
+		if FSP_LAST_GET_DIR == "" or len(FSP_LAST_GET_DIR_PKTS) == 0 or self.fsp.path != FSP_LAST_GET_DIR:
+			FSP_LAST_GET_DIR = self.fsp.path
 			FSP_LAST_GET_DIR_PKTS = []
 
 			rdir_ents = []
-			files = os.listdir(self.fsp_req.directory)
+			files = os.listdir(self.fsp.path)
 			if len(files) > 0:
 				for single in files:
 					# serve .gcz files as .iso files
 					if single.endswith(".gcz"):
 						rdir_ent = RDIRENT()
 						rdir_ent.time = 1592534256
-						rdir_ent.size = GCZImage(osp.join(self.fsp_req.directory, single)).data_size
+						rdir_ent.size = GCZImage(pjoin(self.fsp.path, single)).data_size
 						rdir_ent.type = RDIRENTType.RDTYPE_FILE
 						rdir_ent.name = single.replace(".gcz", ".iso")
 					else:  # serve a regular file
-						rdir_ent = RDIRENT.create(osp.join(self.fsp_req.directory, single))
+						rdir_ent = RDIRENT.create(pjoin(self.fsp.path, single))
 					# add rdirent to processing queue
 					rdir_ents.append(rdir_ent.to_bytes())
 
@@ -555,95 +608,131 @@ class FSPRequestHandler(DatagramRequestHandler):
 					break
 
 		# send the cached packets
-		if self.fsp_req.directory == FSP_LAST_GET_DIR and len(FSP_LAST_GET_DIR_PKTS) > 0:
+		if self.fsp.path == FSP_LAST_GET_DIR and len(FSP_LAST_GET_DIR_PKTS) > 0:
 			if pkt_num == 0:
-				print(f"Reading directory \"{self.fsp_req.directory}\"...")
-			rep = FSPRequest.create(self.fsp_req.command, FSP_LAST_GET_DIR_PKTS[pkt_num][pkt_off:], self.fsp_req.position, self.fsp_req.sequence).to_bytes()
+				print(f"Reading directory \"{self.fsp.path}\"...")
+			rep = FSPPacket.create(self.fsp.command, FSP_LAST_GET_DIR_PKTS[pkt_num][pkt_off:], self.fsp.position, self.fsp.sequence).to_bytes()
 			self.socket.sendto(rep, self.client_address)
 
 	def handle_get_file(self) -> None:
 		global FSP_LAST_GET_FILE, FSP_LAST_GCZ_FILE
 
-		self.fsp_req.block_size = FSP_SPACE
+		self.fsp.block_size = FSP_SPACE
 
-		if (FSP_LAST_GET_FILE == "" or FSP_LAST_GET_FILE != self.fsp_req.filename):
-			FSP_LAST_GET_FILE = self.fsp_req.filename
-			print(f"Serving file \"{self.fsp_req.filename}\"...")
+		if (FSP_LAST_GET_FILE == "" or FSP_LAST_GET_FILE != self.fsp.path):
+			FSP_LAST_GET_FILE = self.fsp.path
+			print(f"Serving file \"{self.fsp.path}\"...")
 
 		# check if the file being served is a .gcz file
-		if self.fsp_req.filename.endswith(".iso") and not osp.isfile(self.fsp_req.filename):
-			gcz_filename = self.fsp_req.filename.replace(".iso", ".gcz")
+		if self.fsp.path.endswith(".iso") and not osp.isfile(self.fsp.path):
+			gcz_filename = self.fsp.path.replace(".iso", ".gcz")
 			if osp.isfile(gcz_filename):
+				# open and cache a GCZ image
 				if FSP_LAST_GCZ_FILE is None:
 					gcz = GCZImage(gcz_filename)
-					gcz.seek(self.fsp_req.position)
-					buf = gcz.read(self.fsp_req.block_size)
+					gcz.seek(self.fsp.position)
+					buf = gcz.read(self.fsp.block_size, True)
 					FSP_LAST_GCZ_FILE = gcz
+				# opening a different GCZ image than the one cached
 				elif FSP_LAST_GCZ_FILE is not None and FSP_LAST_GCZ_FILE.filename != FSP_LAST_GET_FILE.replace(".iso", ".gcz"):
 					FSP_LAST_GCZ_FILE.close()
 					FSP_LAST_GCZ_FILE = None
 
 					gcz = GCZImage(gcz_filename)
-					gcz.seek(self.fsp_req.position)
-					buf = gcz.read(self.fsp_req.block_size)
+					gcz.seek(self.fsp.position)
+					buf = gcz.read(self.fsp.block_size, True)
 					FSP_LAST_GCZ_FILE = gcz
+				# reading from a cached GCZ image
 				else:
 					# print(f"Reading GCZ from cache \"{gcz_filename}\"")
-					FSP_LAST_GCZ_FILE.seek(self.fsp_req.position)
-					buf = FSP_LAST_GCZ_FILE.read(self.fsp_req.block_size)
+					FSP_LAST_GCZ_FILE.seek(self.fsp.position)
+					buf = FSP_LAST_GCZ_FILE.read(self.fsp.block_size, True)
 		else:  # serve a regular file
 			if FSP_LAST_GCZ_FILE is not None:
 				print("Clearing GCZ cache...")
 				FSP_LAST_GCZ_FILE.close()
 				FSP_LAST_GCZ_FILE = None
 
-			with open(self.fsp_req.filename, "rb") as f:
-				f.seek(self.fsp_req.position)
-				buf = f.read(self.fsp_req.block_size)
+			with open(self.fsp.path, "rb") as f:
+				f.seek(self.fsp.position)
+				buf = f.read(self.fsp.block_size)
 
-		rep = FSPRequest.create(self.fsp_req.command, buf, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
+		rep = FSPPacket.create(self.fsp.command, buf, self.fsp.position, self.fsp.sequence).to_bytes()
 		with BytesIO(rep) as bio:
 			while (buf := bio.read(65507)) != b"":
 				self.wfile.write(buf)
 
 	def handle_up_load(self) -> None:
 		with open(FSP_UP_LOAD_CACHE_FILE, "a+b") as f:
-			f.seek(self.fsp_req.position)
-			f.write(self.fsp_req.data)
+			f.seek(self.fsp.position)
+			f.write(self.fsp.data)
 
-		rep = FSPRequest.create(self.fsp_req.command, b"", self.fsp_req.position, self.fsp_req.sequence).to_bytes()
+		rep = FSPPacket.create(self.fsp.command, b"", self.fsp.position, self.fsp.sequence).to_bytes()
 		self.wfile.write(rep)
 
 	def handle_install(self) -> None:
-		print(f"Installing file to \"{self.fsp_req.filename}\"...")
+		print(f"Installing file to \"{self.fsp.path}\"...")
 
-		os.rename(FSP_UP_LOAD_CACHE_FILE, self.fsp_req.filename)
+		os.rename(FSP_UP_LOAD_CACHE_FILE, self.fsp.path)
 
-		rep = FSPRequest.create(self.fsp_req.command, b"", 0, self.fsp_req.sequence).to_bytes()
+		rep = FSPPacket.create(self.fsp.command, b"", 0, self.fsp.sequence).to_bytes()
 		self.wfile.write(rep)
 
 	def handle_del_file(self) -> None:
-		print(f"Deleting file \"{self.fsp_req.filename}\"...")
+		print(f"Deleting file \"{self.fsp.path}\"...")
 
-		if osp.isfile(self.fsp_req.filename):
-			os.remove(self.fsp_req.filename)
-			rep = FSPRequest.create(self.fsp_req.command, b"", self.fsp_req.position, self.fsp_req.sequence).to_bytes()
+		if osp.isfile(self.fsp.path):
+			os.remove(self.fsp.path)
+			rep = FSPPacket.create(self.fsp.command, b"", self.fsp.position, self.fsp.sequence).to_bytes()
 		else:
-			rep = FSPRequest.create(FSPCommand.CC_ERR, b"Error deleting file!", 0, self.fsp_req.sequence).to_bytes()
+			rep = FSPPacket.create(FSPCommand.CC_ERR, b"Error deleting file!", 0, self.fsp.sequence).to_bytes()
 		self.wfile.write(rep)
+
+	def handle_get_pro(self) -> None:
+		print(f"Getting protection on \"{self.fsp.path}\"...")
+
+		v = FSPProtection.OWNER
+		v |= FSPProtection.DEL
+		v |= FSPProtection.ADD
+		v |= FSPProtection.MKDIR
+		v |= FSPProtection.GET
+		# v |= FSPProtection.README
+		v |= FSPProtection.LIST
+		v |= FSPProtection.RENAME
+
+		rep = FSPPacket.create(self.fsp.command, b"", FSP_PRO_BYTES, self.fsp.sequence, pack(">B", v))
+		self.wfile.write(rep.to_bytes())
+
+	def handle_make_dir(self) -> None:
+		print(f"Creating directory \"{self.fsp.path}\"...")
+
+		if not osp.isdir(self.fsp.path):
+			os.mkdir(self.fsp.path)
+
+		v = FSPProtection.OWNER
+		v |= FSPProtection.DEL
+		v |= FSPProtection.ADD
+		v |= FSPProtection.MKDIR
+		v |= FSPProtection.GET
+		# v |= FSPProtection.README
+		v |= FSPProtection.LIST
+		v |= FSPProtection.RENAME
+
+		rep = FSPPacket.create(self.fsp.command, b"", FSP_PRO_BYTES, self.fsp.sequence, pack(">B", v))
+		self.wfile.write(rep.to_bytes())
 
 	def handle_bye(self) -> None:
 		# print("Bye!")
 
-		rep = FSPRequest.create(self.fsp_req.command, b"", 0, self.fsp_req.sequence).to_bytes()
+		rep = FSPPacket.create(self.fsp.command, b"", 0, self.fsp.sequence).to_bytes()
 		self.wfile.write(rep)
 
 	def handle_stat(self) -> None:
-		print(f"Stat'ing file \"{self.fsp_req.filename}\"...")
+		print(f"Stat'ing file \"{self.fsp.path}\"...")
 
 		# stat a .gcz file
-		if self.fsp_req.filename.endswith(".iso") and not osp.isfile(self.fsp_req.filename):
-			gcz_filename = self.fsp_req.filename.replace(".iso", ".gcz")
+		if self.fsp.path.endswith(".iso") and not osp.isfile(self.fsp.path):
+			gcz_filename = self.fsp.path.replace(".iso", ".gcz")
 			if osp.isfile(gcz_filename):
 				stat = FSPSTAT()
 				stat.time = 1592534256
@@ -651,21 +740,31 @@ class FSPRequestHandler(DatagramRequestHandler):
 				stat.type = RDIRENTType.RDTYPE_FILE
 				rep = stat.to_bytes()
 		else:  # stat a regular file
-			rep = FSPSTAT.create(self.fsp_req.filename).to_bytes()
-		rep = FSPRequest.create(self.fsp_req.command, rep, self.fsp_req.position, self.fsp_req.sequence).to_bytes()
+			rep = FSPSTAT.create(self.fsp.path).to_bytes()
+		rep = FSPPacket.create(self.fsp.command, rep, self.fsp.position, self.fsp.sequence).to_bytes()
+		self.wfile.write(rep)
+
+	def handle_rename(self) -> None:
+		print(f"Renaming \"{self.fsp.src_path}\" to \"{self.fsp.dst_path}\"...")
+
+		if osp.exists(self.fsp.src_path):
+			print(f"\"{self.fsp.src_path}\" doesn't exist, skipping...")
+			os.rename(self.fsp.src_path, self.fsp.dst_path)
+
+		rep = FSPPacket.create(self.fsp.command, b"", 0, self.fsp.sequence).to_bytes()
 		self.wfile.write(rep)
 
 	def handle_unhandled(self) -> None:
-		print(self.fsp_req.command)
-		print("Key:", self.fsp_req.key)
-		print("Seq:", self.fsp_req.sequence)
-		print("Pos:", self.fsp_req.position)
+		print(self.fsp.command)
+		print("Key:", self.fsp.key)
+		print("Seq:", self.fsp.sequence)
+		print("Pos:", self.fsp.position)
 
-		if len(self.fsp_req.data) > 0:
-			print(self.fsp_req.data)
+		if len(self.fsp.data) > 0:
+			print(self.fsp.data)
 
-		if len(self.fsp_req.extra) > 0:
-			print(self.fsp_req.extra)
+		if len(self.fsp.extra) > 0:
+			print(self.fsp.extra)
 
 def parse_hostname_port(s: str):
 	hostname_port_exp = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{1,5}")
@@ -694,7 +793,7 @@ def main() -> None:
 
 	print(f"FSP server running on {args.address[0]}:{args.address[1]}...")
 	print(f"Base Directory: \"{osp.abspath(FSP_SERVER_DIR)}\"")
-	with ThreadingUDPServer((args.address[0], args.address[1]), FSPRequestHandler) as server:
+	with ThreadingUDPServer((args.address[0], args.address[1]), FSPPacketHandler) as server:
 		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 		server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, FSP_MAXSPACE)
